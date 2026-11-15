@@ -16,9 +16,6 @@ jobs:
     if: github.repository == 'Dowgen/CodexBar'
     runs-on: xcode-27
     timeout-minutes: 90
-    env:
-      EVIDENCE_DIR: ${{ runner.temp }}/codex-session-quota-evidence
-      CODEXBAR_SESSION_QUOTA_PROOF_DIR: ${{ runner.temp }}/codex-session-quota-evidence
     steps:
       - name: Check out the exact upstream PR source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
@@ -31,12 +28,15 @@ jobs:
           set -euo pipefail
           sudo xcode-select -s /Applications/Xcode_27.0.app/Contents/Developer
           echo "DEVELOPER_DIR=/Applications/Xcode_27.0.app/Contents/Developer" >> "$GITHUB_ENV"
-          mkdir -p "$EVIDENCE_DIR"
+          evidence_dir="$RUNNER_TEMP/codex-session-quota-evidence"
+          echo "EVIDENCE_DIR=$evidence_dir" >> "$GITHUB_ENV"
+          echo "CODEXBAR_SESSION_QUOTA_PROOF_DIR=$evidence_dir" >> "$GITHUB_ENV"
+          mkdir -p "$evidence_dir"
           {
             git rev-parse HEAD
             xcodebuild -version
             swift --version
-          } | tee "$EVIDENCE_DIR/environment.log"
+          } | tee "$evidence_dir/environment.log"
 
       - name: Run the complete repository check
         id: checks
