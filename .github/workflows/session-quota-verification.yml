@@ -1,0 +1,82 @@
+name: Verify Codex session quota
+
+on:
+  push:
+    branches: [verify/codex-session-quota-20261115]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: codex-session-quota-verification
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    if: github.repository == 'Dowgen/CodexBar'
+    runs-on: xcode-27
+    timeout-minutes: 90
+    env:
+      EVIDENCE_DIR: ${{ runner.temp }}/codex-session-quota-evidence
+      CODEXBAR_SESSION_QUOTA_PROOF_DIR: ${{ runner.temp }}/codex-session-quota-evidence
+    steps:
+      - name: Check out the exact upstream PR source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: 850eb374a6fe245d72cd4b85cfc822e153aa29b7
+          persist-credentials: false
+
+      - name: Select the repository-supported Xcode toolchain
+        run: |
+          set -euo pipefail
+          sudo xcode-select -s /Applications/Xcode_27.0.app/Contents/Developer
+          echo "DEVELOPER_DIR=/Applications/Xcode_27.0.app/Contents/Developer" >> "$GITHUB_ENV"
+          mkdir -p "$EVIDENCE_DIR"
+          {
+            git rev-parse HEAD
+            xcodebuild -version
+            swift --version
+          } | tee "$EVIDENCE_DIR/environment.log"
+
+      - name: Run the complete repository check
+        id: checks
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          make check 2>&1 | tee "$EVIDENCE_DIR/make-check.log"
+
+      - name: Run focused regressions and render synthetic source views
+        id: tests
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          ./Scripts/test_fast.sh --jobs 2 --filter 'MenuCardCodexSessionQuotaTests|MenuCardModelCodexProjectionTests|CodexConsumerProjectionTests|MenuCardHeightFingerprintTests|MenuCardBindingQuotaTests|MenuCardVisibilityTests' 2>&1 | tee "$EVIDENCE_DIR/focused-tests.log"
+
+      - name: Verify both screenshot files were produced
+        id: screenshots
+        if: steps.tests.outcome == 'success'
+        run: |
+          set -euo pipefail
+          test -s "$EVIDENCE_DIR/codex-weekly-block-expanded.png"
+          test -s "$EVIDENCE_DIR/codex-weekly-block-compact.png"
+          shasum -a 256 "$EVIDENCE_DIR"/*.png | tee "$EVIDENCE_DIR/screenshots.sha256"
+
+      - name: Upload logs and synthetic UI evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: codex-session-quota-evidence-850eb37
+          path: ${{ env.EVIDENCE_DIR }}
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Require checks, regressions, and screenshot production to pass
+        if: always()
+        env:
+          CHECKS: ${{ steps.checks.outcome }}
+          TESTS: ${{ steps.tests.outcome }}
+          SCREENSHOTS: ${{ steps.screenshots.outcome }}
+        run: |
+          test "$CHECKS" = success
+          test "$TESTS" = success
+          test "$SCREENSHOTS" = success
