@@ -1,4 +1,4 @@
-name: Verify Codex session quota
+name: Verify Codex review follow-up
 
 on:
   push:
@@ -63,6 +63,39 @@ jobs:
           python3 Scripts/ci_swiftpm_cache.py restore --context "$BUILD_CONTEXT" --clean-fallback
           python3 Scripts/ci_swiftpm_cache.py snapshot --context "$BUILD_CONTEXT"
 
+      - name: Reproduce the stale regression from the verified cached build
+        id: before
+        env:
+          CODEXBAR_TEST_NATIVE_TIMEOUT: 300
+          CACHED_BUILD_KEY: ${{ steps.compiled-cache.outputs.cache-matched-key }}
+        run: |
+          set -uo pipefail
+          test -n "$CACHED_BUILD_KEY" || exit 1
+          ./Scripts/test_fast.sh --skip-build --jobs 2 --filter 'CodexWeeklyCapSurfaceTests' 2>&1 | tee "$EVIDENCE_DIR/before-regression.log"
+          result=${PIPESTATUS[0]}
+          echo "$result" > "$EVIDENCE_DIR/before-exit-code.txt"
+          test "$result" -ne 0 || exit 1
+          grep -Fq 'session.percent' "$EVIDENCE_DIR/before-regression.log" || exit 1
+          grep -Fq 'session.resetText' "$EVIDENCE_DIR/before-regression.log" || exit 1
+
+      - name: Check out the corrected tests while retaining build products
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: fe11e9805ce4be18dabda449a91eef270b788658
+          clean: false
+          persist-credentials: false
+
+      - name: Verify unchanged production code and restore matching inputs
+        env:
+          BUILD_CONTEXT: ${{ steps.build-context.outputs.context }}
+        run: |
+          set -euo pipefail
+          git diff --exit-code 274b3ea9dc95136f2fbcbd071d05aa9d1311795c HEAD -- Sources
+          echo 'Production sources are identical to native screenshots at274b3ea.' | tee "$EVIDENCE_DIR/production-equivalence.log"
+          git rev-parse HEAD | tee "$EVIDENCE_DIR/updated-source.txt"
+          python3 Scripts/ci_swiftpm_cache.py restore --context "$BUILD_CONTEXT" --clean-fallback
+          python3 Scripts/ci_swiftpm_cache.py snapshot --context "$BUILD_CONTEXT"
+
       - name: Run the complete repository check
         id: checks
         continue-on-error: true
@@ -77,11 +110,15 @@ jobs:
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
-          name: codex-quota-checks-274b3ea
+          name: codex-quota-checks-fe11e98
           path: |
             ${{ env.EVIDENCE_DIR }}/environment.log
             ${{ env.EVIDENCE_DIR }}/make-check.log
             ${{ env.EVIDENCE_DIR }}/checks-exit-code.txt
+            ${{ env.EVIDENCE_DIR }}/before-regression.log
+            ${{ env.EVIDENCE_DIR }}/before-exit-code.txt
+            ${{ env.EVIDENCE_DIR }}/production-equivalence.log
+            ${{ env.EVIDENCE_DIR }}/updated-source.txt
           retention-days: 14
 
       - name: Build the test products with a separate cold-build deadline
@@ -109,81 +146,34 @@ jobs:
         continue-on-error: true
         run: |
           set -euo pipefail
-          ./Scripts/test_fast.sh --skip-build --jobs 2 --filter 'MenuCardCodexSessionQuotaTests|MenuCardModelCodexProjectionTests|CodexConsumerProjectionTests|MenuCardHeightFingerprintTests|MenuCardBindingQuotaTests' 2>&1 | tee "$EVIDENCE_DIR/focused-tests.log"
+          ./Scripts/test_fast.sh --skip-build --jobs 2 --filter 'MenuCardCodexSessionQuotaTests|MenuCardModelCodexProjectionTests|CodexConsumerProjectionTests|MenuCardHeightFingerprintTests|MenuCardBindingQuotaTests|CodexWeeklyCapSurfaceTests' 2>&1 | tee "$EVIDENCE_DIR/focused-tests.log"
 
       - name: Preserve the successful build and regression checkpoint
         if: steps.tests.outcome == 'success'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
           path: .build
-          key: quota-${{ steps.build-context.outputs.prefix }}274b3ea9dc95136f2fbcbd071d05aa9d1311795c
+          key: quota-${{ steps.build-context.outputs.prefix }}fe11e9805ce4be18dabda449a91eef270b788658
 
-      - name: Package and run the fresh application with an isolated native fixture
-        id: native
-        if: steps.build.outcome == 'success'
-        timeout-minutes: 45
-        continue-on-error: true
-        run: |
-          set -euo pipefail
-          real_swift="$(command -v swift)"
-          wrapper_dir="$(mktemp -d)"
-          export CODEXBAR_REAL_SWIFT="$real_swift"
-          cat > "$wrapper_dir/swift" <<'WRAPPER'
-          #!/bin/bash
-          if [[ "$1" == build ]]; then
-            shift
-            exec "$CODEXBAR_REAL_SWIFT" build --jobs 2 "$@"
-          fi
-          exec "$CODEXBAR_REAL_SWIFT" "$@"
-          WRAPPER
-          chmod +x "$wrapper_dir/swift"
-          PATH="$wrapper_dir:$PATH" CODEXBAR_SIGNING=adhoc ARCHES=arm64 ./Scripts/package_app.sh debug 2>&1 | tee "$EVIDENCE_DIR/package.log"
-          source Scripts/test_environment.sh
-          python3 - <<'PY'
-          import os, pathlib, subprocess, tempfile
-          output = pathlib.Path(os.environ["EVIDENCE_DIR"])
-          with tempfile.TemporaryDirectory(prefix="codexbar-native-proof-home-") as home:
-              environment = os.environ | {"HOME": home, "CFFIXED_USER_HOME": home,
-                  "CODEXBAR_DISABLE_KEYCHAIN_ACCESS": "1", "CODEXBAR_SUPPRESS_TEST_KEYCHAIN_ACCESS": "1"}
-              with (output / "native-launch.log").open("w") as log:
-                  subprocess.run(["./CodexBar.app/Contents/MacOS/CodexBar", "--session-quota-proof-dir", str(output)],
-                      env=environment, stdout=log, stderr=subprocess.STDOUT, check=True, timeout=60)
-          PY
-
-      - name: Verify all screenshot files were produced
-        id: screenshots
-        if: steps.native.outcome == 'success'
-        run: |
-          set -euo pipefail
-          test -s "$EVIDENCE_DIR/codex-weekly-block-expanded.png"
-          test -s "$EVIDENCE_DIR/codex-weekly-block-compact.png"
-          test -s "$EVIDENCE_DIR/codex-weekly-block-settings.png"
-          test -s "$EVIDENCE_DIR/native-codex-weekly-block-expanded.png"
-          test -s "$EVIDENCE_DIR/native-codex-weekly-block-compact.png"
-          test -s "$EVIDENCE_DIR/native-codex-weekly-block-settings.png"
-          shasum -a 256 "$EVIDENCE_DIR"/*.png | tee "$EVIDENCE_DIR/screenshots.sha256"
-
-      - name: Upload logs and synthetic UI evidence
+      - name: Upload before-and-after verification logs
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
-          name: codex-session-quota-evidence-274b3ea
+          name: codex-review-follow-up-fe11e98
           path: ${{ env.EVIDENCE_DIR }}
           if-no-files-found: error
           retention-days: 14
 
-      - name: Require checks, regressions, and screenshot production to pass
+      - name: Require baseline reproduction and updated regressions to pass
         if: always()
         env:
           CHECKS: ${{ steps.checks.outcome }}
           BUILD: ${{ steps.build.outcome }}
           TESTS: ${{ steps.tests.outcome }}
-          NATIVE: ${{ steps.native.outcome }}
-          SCREENSHOTS: ${{ steps.screenshots.outcome }}
+          BASELINE: ${{ steps.before.outcome }}
         run: |
-          printf 'checks=%s\nbuild=%s\ntests=%s\nnative=%s\nscreenshots=%s\n' "$CHECKS" "$BUILD" "$TESTS" "$NATIVE" "$SCREENSHOTS" | tee "$EVIDENCE_DIR/stage-results.txt"
+          printf 'checks=%s\nbuild=%s\ntests=%s\nbaseline=%s\n' "$CHECKS" "$BUILD" "$TESTS" "$BASELINE" | tee "$EVIDENCE_DIR/stage-results.txt"
           test "$CHECKS" = success
           test "$BUILD" = success
           test "$TESTS" = success
-          test "$NATIVE" = success
-          test "$SCREENSHOTS" = success
+          test "$BASELINE" = success
