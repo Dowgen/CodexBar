@@ -70,8 +70,22 @@ jobs:
           CACHED_BUILD_KEY: ${{ steps.compiled-cache.outputs.cache-matched-key }}
         run: |
           set -uo pipefail
+          set +e
           test -n "$CACHED_BUILD_KEY" || exit 1
-          ./Scripts/test_fast.sh --skip-build --jobs 2 --filter 'CodexWeeklyCapSurfaceTests' 2>&1 | tee "$EVIDENCE_DIR/before-regression.log"
+          source Scripts/test_environment.sh
+          python3 - <<'PY' 2>&1 | tee "$EVIDENCE_DIR/before-regression.log"
+          import os, pathlib, sys, tempfile
+          sys.path.insert(0, "Scripts")
+          from ci_swift_test_by_suite import run_command
+          home = tempfile.mkdtemp(prefix="codex-quota-before-home-", dir=os.environ["RUNNER_TEMP"])
+          # Keep this isolated HOME for the lifetime of the ephemeral job: Apple's Metal
+          # toolchain may mount a read-only volume there, which TemporaryDirectory cannot unlink.
+          environment = os.environ | {"HOME": home, "CFFIXED_USER_HOME": home}
+          result = run_command(["swift", "test", "--no-parallel", "--skip-build", "--jobs", "2",
+              "--filter", "CodexWeeklyCapSurfaceTests"], timeout=300, environment=environment)
+          pathlib.Path(os.environ["EVIDENCE_DIR"], "before-home.txt").write_text(home)
+          sys.exit(result)
+          PY
           result=${PIPESTATUS[0]}
           echo "$result" > "$EVIDENCE_DIR/before-exit-code.txt"
           test "$result" -ne 0 || exit 1
@@ -101,6 +115,7 @@ jobs:
         continue-on-error: true
         run: |
           set -uo pipefail
+          set +e
           make check 2>&1 | tee "$EVIDENCE_DIR/make-check.log"
           result=${PIPESTATUS[0]}
           echo "$result" > "$EVIDENCE_DIR/checks-exit-code.txt"
@@ -146,7 +161,20 @@ jobs:
         continue-on-error: true
         run: |
           set -euo pipefail
-          ./Scripts/test_fast.sh --skip-build --jobs 2 --filter 'MenuCardCodexSessionQuotaTests|MenuCardModelCodexProjectionTests|CodexConsumerProjectionTests|MenuCardHeightFingerprintTests|MenuCardBindingQuotaTests|CodexWeeklyCapSurfaceTests' 2>&1 | tee "$EVIDENCE_DIR/focused-tests.log"
+          source Scripts/test_environment.sh
+          python3 - <<'PY' 2>&1 | tee "$EVIDENCE_DIR/focused-tests.log"
+          import os, pathlib, sys, tempfile
+          sys.path.insert(0, "Scripts")
+          from ci_swift_test_by_suite import run_command
+          home = tempfile.mkdtemp(prefix="codex-quota-after-home-", dir=os.environ["RUNNER_TEMP"])
+          environment = os.environ | {"HOME": home, "CFFIXED_USER_HOME": home}
+          suites = "MenuCardCodexSessionQuotaTests|MenuCardModelCodexProjectionTests|CodexConsumerProjectionTests|MenuCardHeightFingerprintTests|MenuCardBindingQuotaTests|CodexWeeklyCapSurfaceTests"
+          result = run_command(["swift", "test", "--no-parallel", "--skip-build", "--jobs", "2",
+              "--filter", suites], timeout=600, environment=environment)
+          pathlib.Path(os.environ["EVIDENCE_DIR"], "after-home.txt").write_text(home)
+          pathlib.Path(os.environ["EVIDENCE_DIR"], "tests-exit-code.txt").write_text(str(result))
+          sys.exit(result)
+          PY
 
       - name: Preserve the successful build and regression checkpoint
         if: steps.tests.outcome == 'success'
