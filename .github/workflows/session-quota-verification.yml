@@ -20,7 +20,7 @@ jobs:
       - name: Check out the exact upstream PR source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          ref: 850eb374a6fe245d72cd4b85cfc822e153aa29b7
+          ref: 282ff99dc049a99c22ff71c424dff8844f7609db
           persist-credentials: false
 
       - name: Select the repository-supported Xcode toolchain
@@ -52,20 +52,55 @@ jobs:
           set -euo pipefail
           ./Scripts/test_fast.sh --jobs 2 --filter 'MenuCardCodexSessionQuotaTests|MenuCardModelCodexProjectionTests|CodexConsumerProjectionTests|MenuCardHeightFingerprintTests|MenuCardBindingQuotaTests|MenuCardVisibilityTests' 2>&1 | tee "$EVIDENCE_DIR/focused-tests.log"
 
-      - name: Verify both screenshot files were produced
-        id: screenshots
+      - name: Package and run the fresh application with an isolated native fixture
+        id: native
         if: steps.tests.outcome == 'success'
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          real_swift="$(command -v swift)"
+          wrapper_dir="$(mktemp -d)"
+          export CODEXBAR_REAL_SWIFT="$real_swift"
+          cat > "$wrapper_dir/swift" <<'WRAPPER'
+          #!/bin/bash
+          if [[ "$1" == build ]]; then
+            shift
+            exec "$CODEXBAR_REAL_SWIFT" build --jobs 2 "$@"
+          fi
+          exec "$CODEXBAR_REAL_SWIFT" "$@"
+          WRAPPER
+          chmod +x "$wrapper_dir/swift"
+          PATH="$wrapper_dir:$PATH" CODEXBAR_SIGNING=adhoc ARCHES=arm64 ./Scripts/package_app.sh debug 2>&1 | tee "$EVIDENCE_DIR/package.log"
+          source Scripts/test_environment.sh
+          python3 - <<'PY'
+          import os, pathlib, subprocess, tempfile
+          output = pathlib.Path(os.environ["EVIDENCE_DIR"])
+          with tempfile.TemporaryDirectory(prefix="codexbar-native-proof-home-") as home:
+              environment = os.environ | {"HOME": home, "CFFIXED_USER_HOME": home,
+                  "CODEXBAR_DISABLE_KEYCHAIN_ACCESS": "1", "CODEXBAR_SUPPRESS_TEST_KEYCHAIN_ACCESS": "1"}
+              with (output / "native-launch.log").open("w") as log:
+                  subprocess.run(["./CodexBar.app/Contents/MacOS/CodexBar", "--session-quota-proof-dir", str(output)],
+                      env=environment, stdout=log, stderr=subprocess.STDOUT, check=True, timeout=60)
+          PY
+
+      - name: Verify all screenshot files were produced
+        id: screenshots
+        if: steps.native.outcome == 'success'
         run: |
           set -euo pipefail
           test -s "$EVIDENCE_DIR/codex-weekly-block-expanded.png"
           test -s "$EVIDENCE_DIR/codex-weekly-block-compact.png"
+          test -s "$EVIDENCE_DIR/codex-weekly-block-settings.png"
+          test -s "$EVIDENCE_DIR/native-codex-weekly-block-expanded.png"
+          test -s "$EVIDENCE_DIR/native-codex-weekly-block-compact.png"
+          test -s "$EVIDENCE_DIR/native-codex-weekly-block-settings.png"
           shasum -a 256 "$EVIDENCE_DIR"/*.png | tee "$EVIDENCE_DIR/screenshots.sha256"
 
       - name: Upload logs and synthetic UI evidence
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
-          name: codex-session-quota-evidence-850eb37
+          name: codex-session-quota-evidence-282ff99
           path: ${{ env.EVIDENCE_DIR }}
           if-no-files-found: error
           retention-days: 14
@@ -75,8 +110,10 @@ jobs:
         env:
           CHECKS: ${{ steps.checks.outcome }}
           TESTS: ${{ steps.tests.outcome }}
+          NATIVE: ${{ steps.native.outcome }}
           SCREENSHOTS: ${{ steps.screenshots.outcome }}
         run: |
           test "$CHECKS" = success
           test "$TESTS" = success
+          test "$NATIVE" = success
           test "$SCREENSHOTS" = success
