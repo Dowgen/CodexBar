@@ -15,12 +15,12 @@ jobs:
   verify:
     if: github.repository == 'Dowgen/CodexBar'
     runs-on: xcode-27
-    timeout-minutes: 90
+    timeout-minutes: 120
     steps:
       - name: Check out the exact upstream PR source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          ref: 282ff99dc049a99c22ff71c424dff8844f7609db
+          ref: 274b3ea9dc95136f2fbcbd071d05aa9d1311795c
           persist-credentials: false
 
       - name: Select the repository-supported Xcode toolchain
@@ -38,23 +38,90 @@ jobs:
             swift --version
           } | tee "$evidence_dir/environment.log"
 
+      - name: Identify the exact SwiftPM cache context
+        id: build-context
+        run: python3 Scripts/ci_swiftpm_cache.py context --lane xcode27-arm64
+
+      - name: Restore verified incremental build inputs
+        id: compiled-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: .build
+          key: quota-${{ steps.build-context.outputs.prefix }}274b3ea9dc95136f2fbcbd071d05aa9d1311795c
+          restore-keys: |
+            quota-${{ steps.build-context.outputs.prefix }}
+
+      - name: Verify cached inputs with a clean fallback
+        env:
+          BUILD_CONTEXT: ${{ steps.build-context.outputs.context }}
+          COMPILED_CACHE_KEY: ${{ steps.compiled-cache.outputs.cache-matched-key }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$COMPILED_CACHE_KEY" ]]; then
+            rm -f .build/ci-inputs.json
+          fi
+          python3 Scripts/ci_swiftpm_cache.py restore --context "$BUILD_CONTEXT" --clean-fallback
+          python3 Scripts/ci_swiftpm_cache.py snapshot --context "$BUILD_CONTEXT"
+
       - name: Run the complete repository check
         id: checks
         continue-on-error: true
         run: |
-          set -euo pipefail
+          set -uo pipefail
           make check 2>&1 | tee "$EVIDENCE_DIR/make-check.log"
+          result=${PIPESTATUS[0]}
+          echo "$result" > "$EVIDENCE_DIR/checks-exit-code.txt"
+          exit "$result"
 
-      - name: Run focused regressions and render synthetic source views
-        id: tests
+      - name: Save the check result before starting the expensive build
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: codex-quota-checks-274b3ea
+          path: |
+            ${{ env.EVIDENCE_DIR }}/environment.log
+            ${{ env.EVIDENCE_DIR }}/make-check.log
+            ${{ env.EVIDENCE_DIR }}/checks-exit-code.txt
+          retention-days: 14
+
+      - name: Build the test products with a separate cold-build deadline
+        id: build
+        if: steps.checks.outcome == 'success'
         continue-on-error: true
         run: |
           set -euo pipefail
-          ./Scripts/test_fast.sh --jobs 2 --filter 'MenuCardCodexSessionQuotaTests|MenuCardModelCodexProjectionTests|CodexConsumerProjectionTests|MenuCardHeightFingerprintTests|MenuCardBindingQuotaTests|MenuCardVisibilityTests' 2>&1 | tee "$EVIDENCE_DIR/focused-tests.log"
+          source Scripts/test_environment.sh
+          python3 - <<'PY' 2>&1 | tee "$EVIDENCE_DIR/build.log"
+          import os, sys, tempfile
+          sys.path.insert(0, "Scripts")
+          from ci_swift_test_by_suite import run_command
+          with tempfile.TemporaryDirectory(prefix="codexbar-proof-build-home-") as home:
+              environment = os.environ | {"HOME": home, "CFFIXED_USER_HOME": home}
+              result = run_command(["swift", "build", "--build-tests", "--jobs", "2"], timeout=3600, environment=environment)
+          sys.exit(result)
+          PY
+
+      - name: Run focused regressions without rebuilding
+        id: tests
+        if: steps.build.outcome == 'success'
+        env:
+          CODEXBAR_TEST_NATIVE_TIMEOUT: 600
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          ./Scripts/test_fast.sh --skip-build --jobs 2 --filter 'MenuCardCodexSessionQuotaTests|MenuCardModelCodexProjectionTests|CodexConsumerProjectionTests|MenuCardHeightFingerprintTests|MenuCardBindingQuotaTests' 2>&1 | tee "$EVIDENCE_DIR/focused-tests.log"
+
+      - name: Preserve the successful build and regression checkpoint
+        if: steps.tests.outcome == 'success'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: .build
+          key: quota-${{ steps.build-context.outputs.prefix }}274b3ea9dc95136f2fbcbd071d05aa9d1311795c
 
       - name: Package and run the fresh application with an isolated native fixture
         id: native
-        if: steps.tests.outcome == 'success'
+        if: steps.build.outcome == 'success'
+        timeout-minutes: 45
         continue-on-error: true
         run: |
           set -euo pipefail
@@ -100,7 +167,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
-          name: codex-session-quota-evidence-282ff99
+          name: codex-session-quota-evidence-274b3ea
           path: ${{ env.EVIDENCE_DIR }}
           if-no-files-found: error
           retention-days: 14
@@ -109,11 +176,14 @@ jobs:
         if: always()
         env:
           CHECKS: ${{ steps.checks.outcome }}
+          BUILD: ${{ steps.build.outcome }}
           TESTS: ${{ steps.tests.outcome }}
           NATIVE: ${{ steps.native.outcome }}
           SCREENSHOTS: ${{ steps.screenshots.outcome }}
         run: |
+          printf 'checks=%s\nbuild=%s\ntests=%s\nnative=%s\nscreenshots=%s\n' "$CHECKS" "$BUILD" "$TESTS" "$NATIVE" "$SCREENSHOTS" | tee "$EVIDENCE_DIR/stage-results.txt"
           test "$CHECKS" = success
+          test "$BUILD" = success
           test "$TESTS" = success
           test "$NATIVE" = success
           test "$SCREENSHOTS" = success
